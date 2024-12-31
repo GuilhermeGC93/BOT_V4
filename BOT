@@ -1,0 +1,120 @@
+import os
+import ccxt
+import websocket
+import json
+import pandas as pd
+import ta
+import requests
+from datetime import datetime
+
+# Retrieve Binance API credentials from environment variables
+API_KEY = os.getenv('binance_api_key')
+API_SECRET = os.getenv('binance_api_secret')
+
+# Create a Binance exchange instance with API credentials
+exchange = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
+})
+
+API_URL = "https://api.binance.com/api/v3/klines"
+SYMBOL = "BTC/USDT"
+INTERVAL = "1m"  # 1 minute interval
+LIMIT = 50  # Fetch 50 candlesticks (50 minutes)
+
+# MACD input parameters
+MACD_FAST_PERIOD = 12
+MACD_SLOW_PERIOD = 26
+MACD_SIGNAL_PERIOD = 9
+
+# Initialize variables
+candles = []
+
+# WebSocket endpoint for 1-minute candlestick data for BTC/USDT
+SOCKET = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
+
+def fetch_historical_data():
+    """Fetches the last 50 minutes of 1-minute candlestick data from Binance."""
+    params = {
+        "symbol": "BTCUSDT",
+        "interval": INTERVAL,
+        "limit": LIMIT
+    }
+    response = requests.get(API_URL, params=params)
+    data = response.json()
+
+    # Transform the data into a list of OHLCV format
+    historical_candles = []
+    for candle in data:
+        historical_candles.append([
+            candle[0] // 1000,  # Open time (in seconds)
+            float(candle[1]),   # Open price
+            float(candle[2]),   # High price
+            float(candle[3]),   # Low price
+            float(candle[4]),   # Close price
+            float(candle[5])    # Volume
+        ])
+    return historical_candles
+
+def on_message(ws, message):
+    global candles
+    
+    # Parse the incoming WebSocket message
+    data = json.loads(message)
+    candle = data['k']
+    
+    # Extract candle information
+    is_candle_closed = candle['x']
+    open_time = candle['t'] // 1000  # Timestamp in seconds
+    open_price = float(candle['o'])
+    close_price = float(candle['c'])
+    high_price = float(candle['h'])
+    low_price = float(candle['l'])
+    volume = float(candle['v'])
+
+    # Only add completed candles
+    if is_candle_closed:
+        # Add the latest candle data to the list
+        candles.append([open_time, open_price, high_price, low_price, close_price, volume])
+
+        # Keep only the last 50 minutes of candles
+        if len(candles) > 50:
+            candles.pop(0)
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(candles, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+
+        # Calculate MACD difference using custom fast, slow, and signal periods
+        macd = ta.trend.MACD(df['close'], window_slow=MACD_SLOW_PERIOD, window_fast=MACD_FAST_PERIOD, window_sign=MACD_SIGNAL_PERIOD)
+        df['macd_diff'] = macd.macd_diff()
+
+        # Add macd_flag column
+        df['macd_flag'] = (df['macd_diff'] > 0) & (df['macd_diff'].shift() <= 0)
+
+        # Get the latest MACD difference value and macd_flag
+        if not pd.isna(df['macd_diff'].iloc[-1]):
+            latest_macd_diff = df['macd_diff'].iloc[-1]
+            latest_macd_flag = df['macd_flag'].iloc[-1]
+            print(f"Latest MACD diff: {latest_macd_diff:.5f} | MACD Flag: {latest_macd_flag} at {df['time'].iloc[-1]}")
+        else:
+            print("Insufficient data to calculate MACD (NaN)")
+
+def on_error(ws, error):
+    print(f"Error: {error}")
+
+def on_close(ws):
+    print("Connection closed")
+
+def on_open(ws):
+    print("WebSocket connection opened")
+
+if __name__ == "__main__":
+    # Fetch historical data (last 50 minutes of 1-minute candles)
+    print("Fetching historical data...")
+    candles = fetch_historical_data()
+
+    # Create a WebSocket connection
+    ws = websocket.WebSocketApp(SOCKET, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws.on_open = on_open
+    ws.run_forever()
